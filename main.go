@@ -3,11 +3,9 @@ package main
 import (
 	"bufio"
 	"fmt"
-	"hash/crc32"
 	"io"
-	"log"
 	"os"
-	"path/filepath"
+	"strings"
 )
 
 func main() {
@@ -15,59 +13,84 @@ func main() {
 	if len(os.Args) > 1 {
 		start = os.Args[1]
 	}
-	//fmt.Printf("Start: %s\n", start)
-	if err := filepath.Walk(start, walkFn); err != nil {
-		log.Fatalf("error: %v", err)
+	for msg := range update(calculate(start)) {
+		fmt.Println(msg)
 	}
 }
 
-func walkFn(path string, info os.FileInfo, err error) error {
-	//fmt.Fprintf(os.Stderr, "Path: %s\n", path)
-	if !info.IsDir() {
-		rr, err := os.Open(path)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Problem with %s: %v\n", path, err)
-			return nil
+func update(in <-chan crcRecord) <-chan string {
+	out := make(chan string)
+	go func() {
+		for c := range in {
+			out <- updateFile(c)
 		}
-		n, o := getCRC(rr)
-		if err = rr.Close(); err != nil {
-			fmt.Fprintf(os.Stderr, "Problem closing %s: %v\n", path, err)
-		}
-
-		fmt.Printf("File: %s\nFOUND CRC %s\n CALC CRC %x\n\n", path, o, n)
-	}
-	return nil
+		close(out)
+	}()
+	return out
 }
 
-func getCRC(in io.Reader) (uint32, string) {
-	h := crc32.NewIEEE()
+func updateFile(c crcRecord) string {
+	in, err := os.Open(c.Path)
+	if err != nil {
+		return fmt.Sprintf("error opening %s: %v", c.Path, err)
+	}
+	tmp := c.Path + ".new"
+	out, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, c.Mode)
+	if err != nil {
+		return fmt.Sprintf("error opening %s: %v", tmp, multiClose(err, in))
+	}
 	r := bufio.NewReader(in)
-	old := ""
-	found := false
-	for {
-		b, err := r.ReadBytes('\n')
-		switch err {
+	done := false
+	header := true
+	for !done {
+		buf, e := r.ReadBytes('\n')
+		switch e {
 		case nil:
 		case io.EOF:
-			return h.Sum32(), old
+			done = true
 		default:
-			fmt.Fprintf(os.Stdout, "Error %v\n", err)
-			return 0, old
+			return fmt.Sprintf("error reading %s: %v", c.Path, multiClose(e, in, out))
 		}
-
-		if !found {
-			if len(b) > 1 && b[0] == '#' {
-				if len(b) > 16 && string(b[:8]) == "# CRC32 " {
-					old = string(b[8:16])
-					found = true
+		if header {
+			if isComment(buf) {
+				if isCRC(buf) {
+					crc := []byte(fmt.Sprintf("%x", c.CRC))
+					if len(crc) != 8 {
+						err = fmt.Errorf("invalid crc '%x'", c.CRC)
+						return fmt.Sprintf("error updating crc: %v", multiClose(err, in, out))
+					}
+					for x, b := range crc {
+						buf[8+x] = b
+					}
+					header = false
 				}
-				continue
 			}
 		}
-		_, err = h.Write(b)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			return 0, old
+		if _, err = out.Write(buf); err != nil {
+			return fmt.Sprintf("error writing %s: %v", c.Path, multiClose(err, in, out))
 		}
 	}
+	if err = multiClose(nil, in, out); err != nil {
+		return fmt.Sprintf("error closing: %v", err)
+	}
+	if err = os.Rename(tmp, c.Path); err != nil {
+		return fmt.Sprintf("error renaming %s to %s: %v", tmp, c.Path, err)
+	}
+	msg := "OK"
+	if c.CRC != c.OldCRC {
+		msg = "Updated"
+	}
+	return fmt.Sprintf("%s %s", c.Path, msg)
+}
+
+func isComment(l []byte) bool { return len(l) > 1 && l[0] == '#' }
+func isCRC(l []byte) bool     { return len(l) > 16 && string(l[:8]) == "# CRC32 " }
+func isLDIF(i os.FileInfo) bool {
+	if i.IsDir() {
+		return false
+	}
+	if strings.HasSuffix(i.Name(), ".ldif") {
+		return true
+	}
+	return false
 }
